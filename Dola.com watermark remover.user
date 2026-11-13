@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name            Dola.com watermark remover
-// @version         1.0.0
+// @version         3.0.2
 // @description     Enhanced: Full interception + SPA support + stealth
 // @author          Me
 // @license         GPL-3.0-or-later
@@ -16,7 +16,7 @@
     var PROTECTOR = "__DOLA_PROTECTOR__";
     if (window[PROTECTOR]) return;
     Object.defineProperty(window, PROTECTOR, {
-        value: { started: Date.now(), version: "3.0.0" },
+        value: { started: Date.now(), version: "3.0.2" },
         configurable: false,
         writable: false,
     });
@@ -95,7 +95,9 @@
 
     var CREATIONS = "creations";
     var IMAGE_ORI_RAW = "image_ori_raw";
+    var IMAGE_RAW = "image_raw";
     var IMAGE_KEYS = ["image_ori", "image_preview", "image_thumb", "image_preview_resize"];
+    var RAW_KEYS = [IMAGE_ORI_RAW, IMAGE_RAW, "ori_raw", "image_original"];
 
     function normalizeString(s) {
         if (typeof s !== "string") return s;
@@ -125,38 +127,78 @@
     }
 
     function isValidRawUrl(url) {
-        return typeof url === "string" && url.includes("~tplv-") && /(image_raw|ori_raw)/i.test(url);
+        if (typeof url !== "string" || !url) return false;
+        if (!url.includes("~tplv-")) return false;
+        return /(image_raw|ori_raw|_raw|_original|gen_image)/i.test(url);
+    }
+
+    function toRawUrl(url) {
+        if (typeof url !== "string" || !url) return url;
+        var marker = url.indexOf("~tplv-");
+        if (marker < 0) return url;
+        var q = url.indexOf("?", marker);
+        var h = url.indexOf("#", marker);
+        var end = q >= 0 ? q : (h >= 0 ? h : url.length);
+        var seg = url.slice(marker, end);
+        var parts = seg.split("-");
+        if (parts.length < 3 || !parts[1]) return url;
+        var token = parts[1];
+        var proc = parts.slice(2).join("-");
+        var procBase = (proc.split(".")[0] || "").toLowerCase();
+        if (!/image|raw|watermark|downsize/i.test(procBase)) return url;
+        var newProc = procBase.indexOf("raw") >= 0 ? procBase : "image_raw";
+        var newSeg = "~tplv-" + token + "-" + newProc + proc.slice(procBase.length);
+        return url.slice(0, marker) + newSeg + url.slice(end);
     }
 
     function rewriteUrl(url) {
-        if (typeof url !== "string" || !url.includes("~tplv-")) return url;
+        if (typeof url !== "string" || !url) return url;
         var k = getPathKey(url);
-        return k ? (state.rawByPath.get(k) || url) : url;
+        if (k) {
+            var mapped = state.rawByPath.get(k);
+            if (mapped) return mapped;
+        }
+        var rw = toRawUrl(url);
+        return rw === url ? url : rw;
+    }
+
+    var RAW_FIELD_NAMES = ["image_ori_raw", "image_raw", "ori_raw", "image_original", "raw_image", "ref_image", "image_ori"];
+
+    function registerImage(obj) {
+        if (!obj || typeof obj !== "object") return false;
+        var img = obj.image && typeof obj.image === "object" ? obj.image : obj;
+        if (!img || typeof img !== "object") return false;
+
+        var rawUrl = null;
+        for (var i = 0; i < RAW_FIELD_NAMES.length; i++) {
+            var f = img[RAW_FIELD_NAMES[i]];
+            if (f && typeof f === "object" && typeof f.url === "string") {
+                rawUrl = f.url;
+                break;
+            }
+        }
+
+        var key = rawUrl ? getPathKey(rawUrl) : "";
+        if (!key) {
+            var thumb = typeof img.thumb_url === "string" ? img.thumb_url : "";
+            if (typeof img.uri === "string" && thumb) {
+                key = getPathKey("https://dola.com/" + img.uri);
+                rawUrl = toRawUrl(thumb);
+            }
+        }
+        if (!key) return false;
+
+        if (rawUrl) {
+            state.rawByPath.set(key, rawUrl);
+            limitMap(state.rawByPath, CONFIG.maxCacheSize);
+        }
+        return true;
     }
 
     function processCreationList(list) {
         if (!Array.isArray(list)) return;
         for (var i = 0; i < list.length; i++) {
-            var item = list[i];
-            var image = item && item.image;
-            if (!image) continue;
-
-            var rawUrl = image[IMAGE_ORI_RAW] && image[IMAGE_ORI_RAW].url;
-            if (!rawUrl) continue;
-
-            var normalizedRaw = normalizeString(rawUrl);
-            var rawValid = isValidRawUrl(normalizedRaw);
-            var rawKey = rawValid ? getPathKey(normalizedRaw) : "";
-
-            for (var j = 0; j < IMAGE_KEYS.length; j++) {
-                var field = image[IMAGE_KEYS[j]];
-                if (field && field.url) field.url = rawUrl;
-            }
-
-            if (rawValid && rawKey) {
-                state.rawByPath.set(rawKey, normalizedRaw);
-                limitMap(state.rawByPath, CONFIG.maxCacheSize);
-            }
+            registerImage(list[i]);
         }
     }
 
@@ -164,8 +206,13 @@
         if (!obj || typeof obj !== "object") return;
         var isArr = Array.isArray(obj);
 
-        if (!isArr && Object.prototype.hasOwnProperty.call(obj, CREATIONS)) {
+        if (!isArr && obj[CREATIONS]) {
             processCreationList(obj[CREATIONS]);
+        }
+        if (!isArr) {
+            try {
+                registerImage(obj);
+            } catch (e) {}
         }
 
         var keys = Object.keys(obj);
@@ -190,7 +237,7 @@
             return data;
         } catch (e) {
             log("parse error: " + e.message, "error");
-            return nativeJSONParse(text);
+            return undefined;
         }
     }
 
@@ -276,15 +323,13 @@
                 enumerable: srcDesc.enumerable,
                 get: srcDesc.get,
                 set: function (v) {
-                    srcDesc.set.call(this, this.isConnected ? v : rewriteUrl(v));
+                    srcDesc.set.call(this, rewriteUrl(String(v || "")));
                 },
             });
         }
         return img;
     }
     DolaImage.prototype = OrigImage.prototype;
-    DolaImage.length = OrigImage.length;
-    DolaImage.name = OrigImage.name;
     try {
         Object.defineProperty(DolaImage, "name", { value: "Image", configurable: true });
     } catch (e) {}
@@ -296,8 +341,7 @@
             enumerable: imgSrcDesc.enumerable,
             get: imgSrcDesc.get,
             set: function (v) {
-                var next = this.isConnected ? v : rewriteUrl(String(v || ""));
-                imgSrcDesc.set.call(this, next);
+                imgSrcDesc.set.call(this, rewriteUrl(String(v || "")));
             },
         });
     }
@@ -363,8 +407,12 @@
             ws.addEventListener("message", function (event) {
                 try {
                     var data = JSON.parse(event.data);
-                    if (data && data.indexOf && data.indexOf(CREATIONS) !== -1) {
-                        traverseData(data);
+                    var wsPayload = data;
+                    if (wsPayload && !wsPayload[CREATIONS] && wsPayload.data && wsPayload.data[CREATIONS]) {
+                        wsPayload = wsPayload.data;
+                    }
+                    if (wsPayload && wsPayload[CREATIONS]) {
+                        traverseData(wsPayload);
                         log("WebSocket data processed", "success");
                     }
                 } catch (e) {}
@@ -490,13 +538,20 @@
         if (count > 0) log("Extracted " + count + " from canvas", "success");
 
         var imgs = document.querySelectorAll("img");
+        var imgIdx = 0;
         imgs.forEach(function (img) {
             var src = img.getAttribute("src") || "";
             if (src.includes("~tplv-")) {
                 var next = rewriteUrl(src);
                 if (next !== src) {
                     img.setAttribute("src", next);
-                    addToQueue(next, "dola_img_" + Date.now() + ".png");
+                    var mappedKey = getPathKey(next);
+                    if (mappedKey && !state.rawByPath.has(mappedKey)) {
+                        state.rawByPath.set(mappedKey, next);
+                        limitMap(state.rawByPath, CONFIG.maxCacheSize);
+                    }
+                    addToQueue(next, "dola_img_" + Date.now() + "_" + imgIdx + ".png");
+                    imgIdx++;
                 }
             }
         });
@@ -549,172 +604,46 @@
 
     function triggerDownload(dataUrl, filename) {
         try {
-            var link = document.createElement("a");
-            link.href = dataUrl;
-            link.download = filename;
-            link.style.display = "none";
-            link.style.opacity = "0";
-            link.style.position = "fixed";
-            link.style.top = "-9999px";
-            document.body.appendChild(link);
-            link.click();
-            setTimeout(function () {
-                if (link.parentNode) link.parentNode.removeChild(link);
-            }, 1000);
+            function doClick(url, name) {
+                var link = document.createElement("a");
+                link.href = url;
+                link.download = name;
+                link.style.display = "none";
+                link.style.opacity = "0";
+                link.style.position = "fixed";
+                link.style.top = "-9999px";
+                document.body.appendChild(link);
+                link.click();
+                setTimeout(function () {
+                    if (link.parentNode) link.parentNode.removeChild(link);
+                }, 1000);
+            }
+            if (typeof dataUrl === "string" && dataUrl.indexOf("data:") === 0) {
+                doClick(dataUrl, filename);
+            } else if (typeof dataUrl === "string" && /^https?:\/\//i.test(dataUrl)) {
+                nativeFetch(dataUrl)
+                    .then(function (res) { return res.blob(); })
+                    .then(function (blob) {
+                        var url = URL.createObjectURL(blob);
+                        doClick(url, filename);
+                        setTimeout(function () {
+                            try { URL.revokeObjectURL(url); } catch (e) {}
+                        }, 5000);
+                    })
+                    .catch(function (e) { log("Download failed: " + e.message, "error"); });
+            } else {
+                doClick(dataUrl, filename);
+            }
         } catch (e) {
             log("Download failed: " + e.message, "error");
         }
     }
 
-    function createUI() {
-        var btn = document.createElement("button");
-        btn.id = "dola-remover-btn-v3";
-        btn.title = "Dola Remover - click to scan, right-click for panel";
-        btn.innerHTML = '<span style="font-size:11px;letter-spacing:1px;font-weight:bold;">IMG</span><br><small>' + state.downloadQueue.length + "</small>";
-        Object.assign(btn.style, {
-            position: "fixed",
-            bottom: "20px",
-            right: "20px",
-            zIndex: "999999",
-            width: "56px",
-            height: "56px",
-            borderRadius: "50%",
-            border: "none",
-            background: "linear-gradient(135deg, #667eea 0%, #764ba2 100%)",
-            color: "#fff",
-            cursor: "pointer",
-            boxShadow: "0 4px 15px rgba(102,126,234,0.4)",
-            display: "flex",
-            flexDirection: "column",
-            alignItems: "center",
-            justifyContent: "center",
-            fontSize: "12px",
-            fontWeight: "bold",
-            fontFamily: "Segoe UI, sans-serif",
-            transition: "all 0.3s",
-            backdropFilter: "blur(10px)",
-        });
-
-        btn.addEventListener("mouseenter", function () {
-            btn.style.transform = "scale(1.15)";
-            btn.style.boxShadow = "0 6px 25px rgba(102,126,234,0.6)";
-        });
-        btn.addEventListener("mouseleave", function () {
-            btn.style.transform = "scale(1)";
-            btn.style.boxShadow = "0 4px 15px rgba(102,126,234,0.4)";
-        });
-        btn.addEventListener("click", function () {
-            scanExistingElements();
-            notify("Scan complete - " + state.downloadQueue.length + " items queued");
-        });
-        btn.addEventListener("contextmenu", function (e) {
-            e.preventDefault();
-            togglePanel();
-        });
-
-        document.body.appendChild(btn);
-
-        var panel = document.createElement("div");
-        panel.id = "dola-remover-panel-v3";
-        panel.style.cssText =
-            "position:fixed;bottom:90px;right:20px;z-index:999999;background:#1e1e2e;border-radius:14px;padding:18px;" +
-            "box-shadow:0 8px 32px rgba(0,0,0,0.5);color:#fff;font-family:'Segoe UI',sans-serif;min-width:280px;display:none;backdrop-filter:blur(10px);";
-        panel.innerHTML =
-            '<div style="font-weight:bold;font-size:16px;margin-bottom:12px;border-bottom:1px solid #444;padding-bottom:8px;">Dola Remover v3</div>' +
-            '<button id="dola-btn-scan" style="width:100%;padding:8px;margin:3px 0;background:#4CAF50;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;">Scan Page</button>' +
-            '<button id="dola-btn-auto" style="width:100%;padding:8px;margin:3px 0;background:#2196F3;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;">Toggle Auto-Download</button>' +
-            '<button id="dola-btn-pause" style="width:100%;padding:8px;margin:3px 0;background:#FF9800;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;">Pause</button>' +
-            '<button id="dola-btn-clear" style="width:100%;padding:8px;margin:3px 0;background:#F44336;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;">Clear Queue</button>' +
-            '<button id="dola-btn-notif" style="width:100%;padding:8px;margin:3px 0;background:#607D8B;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;">Notifications: ' +
-            (CONFIG.enableNotifications ? "ON" : "OFF") +
-            "</button>" +
-            '<button id="dola-btn-log" style="width:100%;padding:8px;margin:3px 0;background:#9C27B0;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;">Logging: ' +
-            (CONFIG.logToConsole ? "ON" : "OFF") +
-            "</button>" +
-            '<hr style="border-color:#444;margin:10px 0;">' +
-            '<div style="font-size:12px;color:#aaa;">' +
-            'Total processed: <span id="dola-stat-total">0</span><br>' +
-            'Queued: <span id="dola-stat-queue">' +
-            state.downloadQueue.length +
-            "</span><br>" +
-            'Mapped paths: <span id="dola-stat-paths">' +
-            state.rawByPath.size +
-            "</span><br>" +
-            'Uptime: <span id="dola-stat-age">0s</span><br>' +
-            "</div>";
-        document.body.appendChild(panel);
-
-        document.getElementById("dola-btn-scan").onclick = function () {
-            scanExistingElements();
-            updateStats();
-        };
-        document.getElementById("dola-btn-auto").onclick = function () {
-            CONFIG.enableAutoDownload = !CONFIG.enableAutoDownload;
-            this.textContent = "Toggle Auto-Download (" + (CONFIG.enableAutoDownload ? "ON" : "OFF") + ")";
-            notify("Auto-download: " + (CONFIG.enableAutoDownload ? "enabled" : "disabled"));
-        };
-        document.getElementById("dola-btn-pause").onclick = function () {
-            state.isDownloading = !state.isDownloading;
-            if (!state.isDownloading) processQueue();
-            this.textContent = state.isDownloading ? "Resume" : "Pause";
-        };
-        document.getElementById("dola-btn-clear").onclick = function () {
-            state.downloadQueue = [];
-            updateStats();
-            notify("Waiting queue cleared");
-        };
-        document.getElementById("dola-btn-notif").onclick = function () {
-            CONFIG.enableNotifications = !CONFIG.enableNotifications;
-            this.textContent = "Notifications: " + (CONFIG.enableNotifications ? "ON" : "OFF");
-        };
-        document.getElementById("dola-btn-log").onclick = function () {
-            CONFIG.logToConsole = !CONFIG.logToConsole;
-            this.textContent = "Logging: " + (CONFIG.logToConsole ? "ON" : "OFF");
-        };
-
-        function updateStats() {
-            var el1 = document.getElementById("dola-stat-total");
-            var el2 = document.getElementById("dola-stat-queue");
-            var el3 = document.getElementById("dola-stat-paths");
-            if (el1) el1.textContent = state.notificationCount;
-            if (el2) el2.textContent = state.downloadQueue.length;
-            if (el3) el3.textContent = state.rawByPath.size;
-        }
-        setInterval(updateStats, 2000);
-        setInterval(function () {
-            var el = document.getElementById("dola-stat-age");
-            if (el) el.textContent = Math.floor((Date.now() - startTime) / 1000) + "s";
-        }, 1000);
-
-        function togglePanel() {
-            panel.style.display = panel.style.display === "none" ? "block" : "none";
-        }
-    }
-
-    function setupKeyboardShortcuts() {
-        if (!CONFIG.enableKeyboardShortcut) return;
-        document.addEventListener("keydown", function (e) {
-            if (e.ctrlKey && e.shiftKey && e.key === "D") {
-                e.preventDefault();
-                scanExistingElements();
-                notify("Manual scan - " + state.downloadQueue.length + " images");
-            }
-            if (e.ctrlKey && e.shiftKey && e.key === "P") {
-                e.preventDefault();
-                var panel = document.getElementById("dola-remover-panel-v3");
-                if (panel) panel.style.display = panel.style.display === "none" ? "block" : "none";
-            }
-        });
-        log("Keyboard shortcuts: Ctrl+Shift+D (scan), Ctrl+Shift+P (panel)", "info");
-    }
-
     var startTime = Date.now();
 
     function init() {
-        log("Dola Remover v3.0.0 initializing...", "success");
+        log("Dola Remover v3.0.2 initializing...", "success");
         log("Matched page: " + location.href, "info");
-        createUI();
-        setupKeyboardShortcuts();
         startObserver();
         startPolling();
         setTimeout(function () {
@@ -727,8 +656,7 @@
             }
         }, CONFIG.autoRunDelay);
 
-        log("Dola Remover v3.0.0 READY", "success");
-        log("Shortcuts: Ctrl+Shift+D | Ctrl+Shift+P", "info");
+        log("Dola Remover v3.0.2 READY", "success");
     }
 
     if (document.readyState === "complete" || document.readyState === "interactive") {
