@@ -7,7 +7,7 @@ Userscript that removes image watermarks on **Dola / Doubao** (`dola.com`, `doub
 - Intercepts image URLs across `fetch`, `XMLHttpRequest`, `WebSocket`, `<img>`, `<source>`, `srcset`, CSS `background-image`, and anchor clicks
 - Full SPA navigation support (History API / turbolinks hooks)
 - Auto-downloads detected images in batches, with queue controls
-- Floating `IMG` button + quick panel to scan, pause, clear queue, toggle options
+- No custom UI — runs silently on top of the official Dola web experience
 
 ## Install
 
@@ -16,9 +16,7 @@ Userscript that removes image watermarks on **Dola / Doubao** (`dola.com`, `doub
 
 ## Usage
 
-- `Ctrl+Shift+D` scan the current page
-- `Ctrl+Shift+P` toggle the control panel
-- Click the floating `IMG` button to scan / open the panel
+- Images with watermarks are swapped to raw URLs and auto-downloaded
 
 ## License
 
