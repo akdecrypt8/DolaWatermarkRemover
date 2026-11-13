@@ -1,0 +1,748 @@
+// ==UserScript==
+// @name            Dola.com watermark remover
+// @version         1.0.0
+// @description     Enhanced: Full interception + SPA support + stealth
+// @author          Me
+// @license         GPL-3.0-or-later
+// @icon            https://lf-flow-web-cdn.doubao.com/obj/flow-doubao/doubao/chat/favicon.png
+// @match           https://www.doubao.com/chat*
+// @match           https://www.dola.com/chat*
+// @run-at          document-start
+// @grant           none
+// ==/UserScript==
+
+(function () {
+    "use strict";
+    var PROTECTOR = "__DOLA_PROTECTOR__";
+    if (window[PROTECTOR]) return;
+    Object.defineProperty(window, PROTECTOR, {
+        value: { started: Date.now(), version: "3.0.0" },
+        configurable: false,
+        writable: false,
+    });
+    var CONFIG = {
+        maxCacheSize: 250,
+        autoRunDelay: 2500,
+        pollingInterval: 4000,
+        downloadBatchSize: 5,
+        downloadDelayMs: 800,
+        logToConsole: true,
+        enableNotifications: true,
+        enableKeyboardShortcut: true,
+        enableAutoDownload: true,
+    };
+
+    var state = {
+        rawByPath: new Map(),
+        normCache: new Map(),
+        pathKeyCache: new Map(),
+        downloadQueue: [],
+        isDownloading: false,
+        isRunning: false,
+        processedResponses: new Set(),
+        observer: null,
+        pollingTimer: null,
+        notificationCount: 0,
+    };
+    var nativeJSONParse = window.JSON.parse;
+    var nativeResponseText = Response.prototype.text;
+    var nativeFetch = window.fetch;
+    var nativeXHROpen = XMLHttpRequest.prototype.open;
+    var nativeXHRSend = XMLHttpRequest.prototype.send;
+    var nativeSendBeacon = navigator.sendBeacon;
+    var nativeAnchorClick = HTMLAnchorElement.prototype.click;
+
+    function limitMap(map, max) {
+        while (map.size > max) {
+            map.delete(map.keys().next().value);
+        }
+    }
+
+    function debounce(fn, wait) {
+        var timeout = null;
+        return function () {
+            var ctx = this;
+            var args = arguments;
+            clearTimeout(timeout);
+            timeout = setTimeout(function () {
+                timeout = null;
+                fn.apply(ctx, args);
+            }, wait);
+        };
+    }
+
+    function log(msg, type) {
+        if (!CONFIG.logToConsole) return;
+        var colors = { info: "#4CAF50", warn: "#FF9800", error: "#F44336", success: "#2196F3" };
+        try {
+            console.log(
+                "%c[DolaRemover v3][" + (type || "INFO") + "] " + msg,
+                "color:" + (colors[type] || "#fff") + ";font-weight:bold"
+            );
+        } catch (e) {}
+    }
+
+    function notify(msg) {
+        if (!CONFIG.enableNotifications) return;
+        try {
+            if (window.Notification && Notification.permission === "granted") {
+                new Notification("Dola Remover", { body: msg });
+            }
+        } catch (e) {}
+        state.notificationCount++;
+        log("Notification: " + msg, "success");
+    }
+
+    var CREATIONS = "creations";
+    var IMAGE_ORI_RAW = "image_ori_raw";
+    var IMAGE_KEYS = ["image_ori", "image_preview", "image_thumb", "image_preview_resize"];
+
+    function normalizeString(s) {
+        if (typeof s !== "string") return s;
+        var cached = state.normCache.get(s);
+        if (cached !== undefined) return cached;
+        var n = s.replace(/\\u002F/g, "/").replace(/\\\//g, "/").replace(/&amp;/g, "&");
+        state.normCache.set(s, n);
+        limitMap(state.normCache, CONFIG.maxCacheSize);
+        return n;
+    }
+
+    function getPathKey(url) {
+        if (typeof url !== "string") return "";
+        var cached = state.pathKeyCache.get(url);
+        if (cached !== undefined) return cached;
+        try {
+            var p = new URL(normalizeString(url), location.href);
+            var idx = p.pathname.indexOf("~tplv-");
+            var k = idx >= 0 ? p.pathname.slice(0, idx) : p.pathname;
+            state.pathKeyCache.set(url, k);
+            limitMap(state.pathKeyCache, CONFIG.maxCacheSize);
+            return k;
+        } catch (e) {
+            state.pathKeyCache.set(url, "");
+            return "";
+        }
+    }
+
+    function isValidRawUrl(url) {
+        return typeof url === "string" && url.includes("~tplv-") && /(image_raw|ori_raw)/i.test(url);
+    }
+
+    function rewriteUrl(url) {
+        if (typeof url !== "string" || !url.includes("~tplv-")) return url;
+        var k = getPathKey(url);
+        return k ? (state.rawByPath.get(k) || url) : url;
+    }
+
+    function processCreationList(list) {
+        if (!Array.isArray(list)) return;
+        for (var i = 0; i < list.length; i++) {
+            var item = list[i];
+            var image = item && item.image;
+            if (!image) continue;
+
+            var rawUrl = image[IMAGE_ORI_RAW] && image[IMAGE_ORI_RAW].url;
+            if (!rawUrl) continue;
+
+            var normalizedRaw = normalizeString(rawUrl);
+            var rawValid = isValidRawUrl(normalizedRaw);
+            var rawKey = rawValid ? getPathKey(normalizedRaw) : "";
+
+            for (var j = 0; j < IMAGE_KEYS.length; j++) {
+                var field = image[IMAGE_KEYS[j]];
+                if (field && field.url) field.url = rawUrl;
+            }
+
+            if (rawValid && rawKey) {
+                state.rawByPath.set(rawKey, normalizedRaw);
+                limitMap(state.rawByPath, CONFIG.maxCacheSize);
+            }
+        }
+    }
+
+    function traverseData(obj) {
+        if (!obj || typeof obj !== "object") return;
+        var isArr = Array.isArray(obj);
+
+        if (!isArr && Object.prototype.hasOwnProperty.call(obj, CREATIONS)) {
+            processCreationList(obj[CREATIONS]);
+        }
+
+        var keys = Object.keys(obj);
+        for (var i = 0; i < keys.length; i++) {
+            if (!isArr && keys[i] === CREATIONS) continue;
+            var child = obj[keys[i]];
+            if (child && typeof child === "object") traverseData(child);
+        }
+    }
+
+    function parseAndProcess(text) {
+        try {
+            var sig = typeof text === "string" ? text.substring(0, 100) : "";
+            if (state.processedResponses.has(sig)) return nativeJSONParse(text);
+
+            var data = nativeJSONParse(text);
+            state.processedResponses.add(sig);
+
+            if (typeof text === "string" && text.indexOf(CREATIONS) !== -1) {
+                traverseData(data);
+            }
+            return data;
+        } catch (e) {
+            log("parse error: " + e.message, "error");
+            return nativeJSONParse(text);
+        }
+    }
+
+    window.JSON.parse = function (text) {
+        return parseAndProcess(text);
+    };
+
+    Response.prototype.json = function () {
+        return nativeResponseText.call(this).then(function (text) {
+            return parseAndProcess(text);
+        });
+    };
+
+    Response.prototype.arrayBuffer = (function (orig) {
+        return function () {
+            var url = this.url || "";
+            if (url.includes("~tplv-") && url.includes("image")) {
+                log("ArrayBuffer intercepted for image: " + url.substring(0, 60), "info");
+            }
+            return orig.apply(this);
+        };
+    })(Response.prototype.arrayBuffer);
+
+    if (typeof nativeSendBeacon === "function") {
+        navigator.sendBeacon = function (url, data) {
+            var rewritten = rewriteUrl(String(url || ""));
+            return nativeSendBeacon.apply(this, [rewritten, data]);
+        };
+    }
+
+    if (typeof nativeFetch === "function") {
+        window.fetch = function (resource, init) {
+            var nextRes = resource;
+            try {
+                if (typeof resource === "string") {
+                    nextRes = rewriteUrl(resource);
+                } else if (resource instanceof Request) {
+                    var rw = rewriteUrl(resource.url);
+                    if (rw !== resource.url) nextRes = new Request(rw, resource);
+                }
+            } catch (e) {}
+            return nativeFetch.call(this, nextRes, init);
+        };
+    }
+
+    XMLHttpRequest.prototype.open = function (method, url) {
+        var nextUrl = rewriteUrl(String(url || ""));
+        try {
+            this.__dola_url = nextUrl;
+        } catch (e) {}
+        return nativeXHROpen.apply(this, [method, nextUrl].concat(Array.prototype.slice.call(arguments, 2)));
+    };
+
+    XMLHttpRequest.prototype.send = function (body) {
+        var reqUrl = this.__dola_url || "";
+        if (reqUrl.includes("image") || reqUrl.includes("file")) {
+            this.addEventListener("load", function () {
+                try {
+                    if (this.responseType === "blob" || this.getResponseHeader("content-type")?.includes("image")) {
+                        var reader = new FileReader();
+                        reader.onload = function () {
+                            var key = reader.result.substring(0, 50);
+                            if (!state.processedResponses.has(key)) {
+                                state.processedResponses.add(key);
+                                addToQueue(reader.result, "dola_xhr_" + Date.now() + ".png");
+                            }
+                        };
+                        reader.readAsDataURL(this.response);
+                    }
+                } catch (e) {}
+            });
+        }
+        return nativeXHRSend.apply(this, [body]);
+    };
+
+    var OrigImage = window.Image;
+    function DolaImage(w, h) {
+        var img = new OrigImage(w, h);
+        var srcDesc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "src");
+        if (srcDesc?.set) {
+            Object.defineProperty(img, "src", {
+                configurable: true,
+                enumerable: srcDesc.enumerable,
+                get: srcDesc.get,
+                set: function (v) {
+                    srcDesc.set.call(this, this.isConnected ? v : rewriteUrl(v));
+                },
+            });
+        }
+        return img;
+    }
+    DolaImage.prototype = OrigImage.prototype;
+    DolaImage.length = OrigImage.length;
+    DolaImage.name = OrigImage.name;
+    try {
+        Object.defineProperty(DolaImage, "name", { value: "Image", configurable: true });
+    } catch (e) {}
+
+    var imgSrcDesc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "src");
+    if (imgSrcDesc?.set) {
+        Object.defineProperty(HTMLImageElement.prototype, "src", {
+            configurable: true,
+            enumerable: imgSrcDesc.enumerable,
+            get: imgSrcDesc.get,
+            set: function (v) {
+                var next = this.isConnected ? v : rewriteUrl(String(v || ""));
+                imgSrcDesc.set.call(this, next);
+            },
+        });
+    }
+
+    if (typeof HTMLSourceElement !== "undefined") {
+        var srcDesc = Object.getOwnPropertyDescriptor(HTMLSourceElement.prototype, "src");
+        if (srcDesc?.set) {
+            Object.defineProperty(HTMLSourceElement.prototype, "src", {
+                configurable: true,
+                enumerable: srcDesc.enumerable,
+                get: srcDesc.get,
+                set: function (v) {
+                    srcDesc.set.call(this, rewriteUrl(v));
+                },
+            });
+        }
+        var srcsetDesc = Object.getOwnPropertyDescriptor(HTMLSourceElement.prototype, "srcset");
+        if (srcsetDesc?.set) {
+            Object.defineProperty(HTMLSourceElement.prototype, "srcset", {
+                configurable: true,
+                enumerable: srcsetDesc.enumerable,
+                get: srcsetDesc.get,
+                set: function (v) {
+                    var rewritten = String(v || "").replace(/(https?:\/\/[^,\s]+)/g, function (m) {
+                        return rewriteUrl(m);
+                    });
+                    srcsetDesc.set.call(this, rewritten);
+                },
+            });
+        }
+    }
+
+    if (typeof CSSStyleDeclaration !== "undefined") {
+        var setPropOrig = CSSStyleDeclaration.prototype.setProperty;
+        CSSStyleDeclaration.prototype.setProperty = function (prop, value) {
+            if (prop === "background-image" && value.includes("~tplv-")) {
+                value = value.replace(/(url\()([^)]+)(\))/g, function (m, o, u, c) {
+                    return o + rewriteUrl(u.replace(/['"]/g, "")) + c;
+                });
+            }
+            return setPropOrig.apply(this, [prop, value]);
+        };
+    }
+
+    if (typeof URL.createObjectURL === "function") {
+        var origCreateObjectURL = URL.createObjectURL;
+        URL.createObjectURL = function (blob) {
+            try {
+                if (blob.type && blob.type.includes("image")) {
+                    log("Blob URL created for image", "info");
+                }
+            } catch (e) {}
+            return origCreateObjectURL.apply(this, [blob]);
+        };
+    }
+
+    var OrigWebSocket = window.WebSocket;
+    if (OrigWebSocket) {
+        window.WebSocket = function (url, protocols) {
+            var rewrittenUrl = rewriteUrl(String(url || ""));
+            var ws = new OrigWebSocket(rewrittenUrl, protocols);
+
+            ws.addEventListener("message", function (event) {
+                try {
+                    var data = JSON.parse(event.data);
+                    if (data && data.indexOf && data.indexOf(CREATIONS) !== -1) {
+                        traverseData(data);
+                        log("WebSocket data processed", "success");
+                    }
+                } catch (e) {}
+            });
+
+            return ws;
+        };
+        window.WebSocket.prototype = OrigWebSocket.prototype;
+        try {
+            Object.defineProperty(window.WebSocket, "name", { value: "WebSocket", configurable: true });
+        } catch (e) {}
+        log("WebSocket interception activated", "info");
+    }
+
+    function tryPatchAnchor(anchor) {
+        if (!(anchor instanceof HTMLAnchorElement)) return;
+        var href = anchor.getAttribute("href") || anchor.href || "";
+        if (!href.includes("~tplv-")) return;
+        var next = rewriteUrl(href);
+        if (next && next !== href) {
+            anchor.setAttribute("href", next);
+            log("Anchor rewritten: " + next.substring(0, 60), "success");
+        }
+    }
+
+    document.addEventListener(
+        "click",
+        function (e) {
+            var t = e.target;
+            if (!t || !(t instanceof Element)) return;
+            var a = t.closest("a[href]");
+            if (a) tryPatchAnchor(a);
+        },
+        true
+    );
+
+    HTMLAnchorElement.prototype.click = function () {
+        try {
+            tryPatchAnchor(this);
+        } catch (e) {}
+        return nativeAnchorClick.apply(this, arguments);
+    };
+
+    function handleSPANavigation() {
+        log("SPA navigation detected - re-initializing", "info");
+        if (state.observer) state.observer.disconnect();
+        startObserver();
+        setTimeout(function () {
+            scanExistingElements();
+        }, 500);
+        notify("Rescan triggered");
+    }
+
+    function patchHistoryAPI() {
+        var origPushState = history.pushState;
+        var origReplaceState = history.replaceState;
+
+        history.pushState = function (state, title, url) {
+            origPushState.apply(this, arguments);
+            handleSPANavigation();
+        };
+        history.replaceState = function (state, title, url) {
+            origReplaceState.apply(this, arguments);
+            handleSPANavigation();
+        };
+
+        window.addEventListener("popstate", function () {
+            handleSPANavigation();
+        });
+
+        log("History API patched (SPA support)", "success");
+    }
+
+    patchHistoryAPI();
+
+    function startPerformanceObserver() {
+        if (typeof PerformanceObserver === "undefined") return;
+        try {
+            var po = new PerformanceObserver(function (list) {
+                var entries = list.getEntries();
+                for (var i = 0; i < entries.length; i++) {
+                    var entry = entries[i];
+                    if (entry.initiatorType === "img" || entry.initiatorType === "css" || entry.initiatorType === "xmlhttprequest") {
+                        var url = entry.name || "";
+                        if (url.includes("~tplv-")) {
+                            var rewritten = rewriteUrl(url);
+                            if (rewritten !== url) {
+                                log("PerformanceObserver caught: " + url.substring(0, 50), "info");
+                            }
+                        }
+                    }
+                }
+            });
+            po.observe({ type: "resource", buffered: true });
+            log("PerformanceObserver started", "success");
+        } catch (e) {
+            log("PerformanceObserver not supported", "warn");
+        }
+    }
+
+    startPerformanceObserver();
+
+    function scanExistingElements() {
+        // Canvas elements
+        var canvases = document.querySelectorAll("canvas");
+        var count = 0;
+        canvases.forEach(function (canvas) {
+            try {
+                if (canvas.width > 0 && canvas.height > 0) {
+                    var ctx = canvas.getContext("2d");
+                    if (ctx) {
+                        var dataUrl = canvas.toDataURL("image/png");
+                        var key = dataUrl.substring(0, 50);
+                        if (!state.processedResponses.has(key)) {
+                            state.processedResponses.add(key);
+                            addToQueue(dataUrl, "dola_canvas_" + Date.now() + "_" + count + ".png");
+                            count++;
+                        }
+                    }
+                }
+            } catch (e) {}
+        });
+        if (count > 0) log("Extracted " + count + " from canvas", "success");
+
+        var imgs = document.querySelectorAll("img");
+        imgs.forEach(function (img) {
+            var src = img.getAttribute("src") || "";
+            if (src.includes("~tplv-")) {
+                var next = rewriteUrl(src);
+                if (next !== src) {
+                    img.setAttribute("src", next);
+                    addToQueue(next, "dola_img_" + Date.now() + ".png");
+                }
+            }
+        });
+    }
+
+    var debouncedScan = debounce(scanExistingElements, 1200);
+
+    function startObserver() {
+        if (state.observer) state.observer.disconnect();
+        state.observer = new MutationObserver(debouncedScan);
+        state.observer.observe(document.body || document.documentElement, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ["src", "href", "srcset", "style", "class"],
+        });
+        log("MutationObserver started", "success");
+    }
+
+    function startPolling() {
+        state.pollingTimer = setInterval(function () {
+            debouncedScan();
+        }, CONFIG.pollingInterval);
+    }
+
+    function addToQueue(dataUrl, filename) {
+        state.downloadQueue.push({ dataUrl: dataUrl, filename: filename });
+        if (CONFIG.enableAutoDownload && !state.isDownloading) {
+            processQueue();
+        }
+    }
+
+    function processQueue() {
+        if (state.downloadQueue.length === 0) {
+            state.isDownloading = false;
+            return;
+        }
+        state.isDownloading = true;
+        var batch = state.downloadQueue.splice(0, CONFIG.downloadBatchSize);
+        batch.forEach(function (item, i) {
+            setTimeout(function () {
+                triggerDownload(item.dataUrl, item.filename);
+                state.notificationCount++;
+            }, i * CONFIG.downloadDelayMs);
+        });
+        setTimeout(function () {
+            processQueue();
+        }, batch.length * CONFIG.downloadDelayMs + 500);
+    }
+
+    function triggerDownload(dataUrl, filename) {
+        try {
+            var link = document.createElement("a");
+            link.href = dataUrl;
+            link.download = filename;
+            link.style.display = "none";
+            link.style.opacity = "0";
+            link.style.position = "fixed";
+            link.style.top = "-9999px";
+            document.body.appendChild(link);
+            link.click();
+            setTimeout(function () {
+                if (link.parentNode) link.parentNode.removeChild(link);
+            }, 1000);
+        } catch (e) {
+            log("Download failed: " + e.message, "error");
+        }
+    }
+
+    function createUI() {
+        var btn = document.createElement("button");
+        btn.id = "dola-remover-btn-v3";
+        btn.title = "Dola Remover - click to scan, right-click for panel";
+        btn.innerHTML = '<span style="font-size:11px;letter-spacing:1px;font-weight:bold;">IMG</span><br><small>' + state.downloadQueue.length + "</small>";
+        Object.assign(btn.style, {
+            position: "fixed",
+            bottom: "20px",
+            right: "20px",
+            zIndex: "999999",
+            width: "56px",
+            height: "56px",
+            borderRadius: "50%",
+            border: "none",
+            background: "linear-gradient(135deg, #667eea 0%, #764ba2 100%)",
+            color: "#fff",
+            cursor: "pointer",
+            boxShadow: "0 4px 15px rgba(102,126,234,0.4)",
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            justifyContent: "center",
+            fontSize: "12px",
+            fontWeight: "bold",
+            fontFamily: "Segoe UI, sans-serif",
+            transition: "all 0.3s",
+            backdropFilter: "blur(10px)",
+        });
+
+        btn.addEventListener("mouseenter", function () {
+            btn.style.transform = "scale(1.15)";
+            btn.style.boxShadow = "0 6px 25px rgba(102,126,234,0.6)";
+        });
+        btn.addEventListener("mouseleave", function () {
+            btn.style.transform = "scale(1)";
+            btn.style.boxShadow = "0 4px 15px rgba(102,126,234,0.4)";
+        });
+        btn.addEventListener("click", function () {
+            scanExistingElements();
+            notify("Scan complete - " + state.downloadQueue.length + " items queued");
+        });
+        btn.addEventListener("contextmenu", function (e) {
+            e.preventDefault();
+            togglePanel();
+        });
+
+        document.body.appendChild(btn);
+
+        var panel = document.createElement("div");
+        panel.id = "dola-remover-panel-v3";
+        panel.style.cssText =
+            "position:fixed;bottom:90px;right:20px;z-index:999999;background:#1e1e2e;border-radius:14px;padding:18px;" +
+            "box-shadow:0 8px 32px rgba(0,0,0,0.5);color:#fff;font-family:'Segoe UI',sans-serif;min-width:280px;display:none;backdrop-filter:blur(10px);";
+        panel.innerHTML =
+            '<div style="font-weight:bold;font-size:16px;margin-bottom:12px;border-bottom:1px solid #444;padding-bottom:8px;">Dola Remover v3</div>' +
+            '<button id="dola-btn-scan" style="width:100%;padding:8px;margin:3px 0;background:#4CAF50;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;">Scan Page</button>' +
+            '<button id="dola-btn-auto" style="width:100%;padding:8px;margin:3px 0;background:#2196F3;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;">Toggle Auto-Download</button>' +
+            '<button id="dola-btn-pause" style="width:100%;padding:8px;margin:3px 0;background:#FF9800;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;">Pause</button>' +
+            '<button id="dola-btn-clear" style="width:100%;padding:8px;margin:3px 0;background:#F44336;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;">Clear Queue</button>' +
+            '<button id="dola-btn-notif" style="width:100%;padding:8px;margin:3px 0;background:#607D8B;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;">Notifications: ' +
+            (CONFIG.enableNotifications ? "ON" : "OFF") +
+            "</button>" +
+            '<button id="dola-btn-log" style="width:100%;padding:8px;margin:3px 0;background:#9C27B0;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;">Logging: ' +
+            (CONFIG.logToConsole ? "ON" : "OFF") +
+            "</button>" +
+            '<hr style="border-color:#444;margin:10px 0;">' +
+            '<div style="font-size:12px;color:#aaa;">' +
+            'Total processed: <span id="dola-stat-total">0</span><br>' +
+            'Queued: <span id="dola-stat-queue">' +
+            state.downloadQueue.length +
+            "</span><br>" +
+            'Mapped paths: <span id="dola-stat-paths">' +
+            state.rawByPath.size +
+            "</span><br>" +
+            'Uptime: <span id="dola-stat-age">0s</span><br>' +
+            "</div>";
+        document.body.appendChild(panel);
+
+        document.getElementById("dola-btn-scan").onclick = function () {
+            scanExistingElements();
+            updateStats();
+        };
+        document.getElementById("dola-btn-auto").onclick = function () {
+            CONFIG.enableAutoDownload = !CONFIG.enableAutoDownload;
+            this.textContent = "Toggle Auto-Download (" + (CONFIG.enableAutoDownload ? "ON" : "OFF") + ")";
+            notify("Auto-download: " + (CONFIG.enableAutoDownload ? "enabled" : "disabled"));
+        };
+        document.getElementById("dola-btn-pause").onclick = function () {
+            state.isDownloading = !state.isDownloading;
+            if (!state.isDownloading) processQueue();
+            this.textContent = state.isDownloading ? "Resume" : "Pause";
+        };
+        document.getElementById("dola-btn-clear").onclick = function () {
+            state.downloadQueue = [];
+            updateStats();
+            notify("Waiting queue cleared");
+        };
+        document.getElementById("dola-btn-notif").onclick = function () {
+            CONFIG.enableNotifications = !CONFIG.enableNotifications;
+            this.textContent = "Notifications: " + (CONFIG.enableNotifications ? "ON" : "OFF");
+        };
+        document.getElementById("dola-btn-log").onclick = function () {
+            CONFIG.logToConsole = !CONFIG.logToConsole;
+            this.textContent = "Logging: " + (CONFIG.logToConsole ? "ON" : "OFF");
+        };
+
+        function updateStats() {
+            var el1 = document.getElementById("dola-stat-total");
+            var el2 = document.getElementById("dola-stat-queue");
+            var el3 = document.getElementById("dola-stat-paths");
+            if (el1) el1.textContent = state.notificationCount;
+            if (el2) el2.textContent = state.downloadQueue.length;
+            if (el3) el3.textContent = state.rawByPath.size;
+        }
+        setInterval(updateStats, 2000);
+        setInterval(function () {
+            var el = document.getElementById("dola-stat-age");
+            if (el) el.textContent = Math.floor((Date.now() - startTime) / 1000) + "s";
+        }, 1000);
+
+        function togglePanel() {
+            panel.style.display = panel.style.display === "none" ? "block" : "none";
+        }
+    }
+
+    function setupKeyboardShortcuts() {
+        if (!CONFIG.enableKeyboardShortcut) return;
+        document.addEventListener("keydown", function (e) {
+            if (e.ctrlKey && e.shiftKey && e.key === "D") {
+                e.preventDefault();
+                scanExistingElements();
+                notify("Manual scan - " + state.downloadQueue.length + " images");
+            }
+            if (e.ctrlKey && e.shiftKey && e.key === "P") {
+                e.preventDefault();
+                var panel = document.getElementById("dola-remover-panel-v3");
+                if (panel) panel.style.display = panel.style.display === "none" ? "block" : "none";
+            }
+        });
+        log("Keyboard shortcuts: Ctrl+Shift+D (scan), Ctrl+Shift+P (panel)", "info");
+    }
+
+    var startTime = Date.now();
+
+    function init() {
+        log("Dola Remover v3.0.0 initializing...", "success");
+        log("Matched page: " + location.href, "info");
+        createUI();
+        setupKeyboardShortcuts();
+        startObserver();
+        startPolling();
+        setTimeout(function () {
+            scanExistingElements();
+        }, 1000);
+        setTimeout(function () {
+            if (CONFIG.enableAutoDownload) {
+                scanExistingElements();
+                notify("Active - " + state.rawByPath.size + " paths mapped");
+            }
+        }, CONFIG.autoRunDelay);
+
+        log("Dola Remover v3.0.0 READY", "success");
+        log("Shortcuts: Ctrl+Shift+D | Ctrl+Shift+P", "info");
+    }
+
+    if (document.readyState === "complete" || document.readyState === "interactive") {
+        setTimeout(init, 500);
+    } else {
+        document.addEventListener("DOMContentLoaded", function () {
+            setTimeout(init, 500);
+        });
+    }
+
+    document.addEventListener("turbo:load", function () {
+        handleSPANavigation();
+    });
+    document.addEventListener("turbolinks:load", function () {
+        handleSPANavigation();
+    });
+})();
